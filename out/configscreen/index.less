@@ -151,18 +151,16 @@ body {
 
 
 input, button, a.button {
-  background: var(--vscode-input-background); //#333;
-  //border: 1px solid #39464e;
-  border: 1px solid transparent;
+  background: #333;
+  border: 1px solid #39464e;
   border-radius: 4px;
-  color: var(--vscode-input-foreground);
+  color: inherit;
   padding: .25em .5em;
   
   font-family: inherit;
   
   &:hover {
-    //background:  var(--vscode-button-hover-background); //#666;
-    // err: border: 1px solid var(--vscode-input-border);
+    background: #666;
   }
 }
 
@@ -209,8 +207,6 @@ button, a.button {
   position: absolute;
   top: 2em;
   right: 2em;
-
-  color: white;
 }
 
 
@@ -247,12 +243,12 @@ label.enable {
     left: 0;
     height: @checkboxSize;
     width: @checkboxSize;
-    background-color: #333;; //rgb(93, 175, 241); //#333;
+    background-color: #333;
   }
 
   /* On mouse-over, add a grey background color */
   &:hover input ~ .checkmark {
-    background-color: #666; //rgb(140, 195, 240); //#666;
+    background-color: #666;
   }
 
   /* When the checkbox is checked, add a blue background */
