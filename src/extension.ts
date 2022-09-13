@@ -1,9 +1,15 @@
-import * as vscode from "vscode";
+/*
+ Known BUGs:
+  - tsx recovers after an error: done with errors. It should not output on error.
+  - sass/scss sourcemaps are no real sourcemaps (they are based on compiled sass/scss)
+  - sass/scss compiles because of proccess.chdir(sassfile_root) -> this should not be.
+*/
+import * as vscode from 'vscode';
 import * as fs from "fs";
 import * as p from "path";
 import { exec } from "child_process";
-const { compileSass, sass } = require("./sass/index");
-const { src, dest } = require("gulp");
+import SassHelper from "./sass/index";
+const { src, dest } = require("gulp"); 
 const uglify = require("gulp-uglify");
 const rename = require("gulp-rename");
 const babel = require("gulp-babel");
@@ -13,10 +19,18 @@ const cssmin = require("gulp-minify-css");
 const ts = require("gulp-typescript");
 const jade = require("gulp-jade");
 const pug = require("pug");
+const sourcemaps = require("gulp-sourcemaps");
 const open = require("open");
 const through = require("through2");
-const successMessage = "✔ Compilation Successed!";
-const errorMessage = "❌ Compilation Failed!";
+const applySourceMap = require('vinyl-sourcemaps-apply');
+const htmlmin = require('gulp-htmlmin');
+
+const util_noop = () => through.obj(); /* not working anymore gulp.`util`.noop() */
+
+import * as configscreen from "./lib/configscreen";
+
+const sass = new SassHelper();
+
 const readFileContext = (path: string): string => {
   return fs.readFileSync(path).toString();
 };
@@ -35,7 +49,7 @@ const command = (cmd: string) => {
 };
 const transformPort = (data: string): string => {
   let port: string = "";
-  data.split(/[\n|\r]/).forEach((item) => {
+  data.split(/[\n|\r]/).forEach(item => {
     if (item.indexOf("LISTEN") !== -1 && !port) {
       let reg = item.split(/\s+/);
       if (/\d+/.test(reg[1])) {
@@ -45,205 +59,363 @@ const transformPort = (data: string): string => {
   });
   return port;
 };
-const empty = function (code: string) {
+const empty = function(code: string, map?: any) {
   let stream = through.obj((file: any, encoding: any, callback: any) => {
+    //debugger;
     if (!file.isBuffer()) {
       return callback();
     }
     file.contents = Buffer.from(code || "");
+    
+    if (file.sourceMap && map) {
+      applySourceMap(file, map);
+    }
+
     stream.push(file);
     callback();
   });
   return stream;
 };
-const readFileName = async (path: string, fileContext: string) => {
+
+const readFileName = async (uri: vscode.Uri, fileContext: string) => {
+  let path = uri.fsPath;
   let fileSuffix = fileType(path);
   let config = vscode.workspace.getConfiguration("compile-hero");
   let outputDirectoryPath: any = {
-    ".js": config.get<string>("javascript-output-directory") || "",
-    ".scss": config.get<string>("scss-output-directory") || "",
+    ".html": config.get<string>("html-output-directory") || "",
+    ".js":   config.get<string>("javascript-output-directory") || "",
+    ".scss": config.get<string>("sass-output-directory") || "",
     ".sass": config.get<string>("sass-output-directory") || "",
     ".less": config.get<string>("less-output-directory") || "",
     ".jade": config.get<string>("jade-output-directory") || "",
-    ".ts": config.get<string>("typescript-output-directory") || "",
-    ".tsx": config.get<string>("typescriptx-output-directory") || "",
-    ".pug": config.get<string>("pug-output-directory") || "",
+    ".ts":   config.get<string>("typescript-output-directory") || "",
+    ".tsx":  config.get<string>("typescriptx-output-directory") || "",
+    ".pug":  config.get<string>("pug-output-directory") || ""
   };
   let compileStatus: any = {
-    ".js": config.get<boolean>("javascript-output-toggle"),
-    ".scss": config.get<boolean>("scss-output-toggle"),
+    ".html": config.get<boolean>("html-output-toggle"),
+    ".js":   config.get<boolean>("javascript-output-toggle"),
+    ".scss": config.get<boolean>("sass-output-toggle"),
     ".sass": config.get<boolean>("sass-output-toggle"),
     ".less": config.get<boolean>("less-output-toggle"),
     ".jade": config.get<boolean>("jade-output-toggle"),
-    ".ts": config.get<boolean>("typescript-output-toggle"),
-    ".tsx": config.get<boolean>("typescriptx-output-toggle"),
-    ".pug": config.get<boolean>("pug-output-toggle"),
+    ".ts":   config.get<boolean>("typescript-output-toggle"),
+    ".tsx":  config.get<boolean>("typescriptx-output-toggle"),
+    ".pug":  config.get<boolean>("pug-output-toggle")
   };
   if (!compileStatus[fileSuffix]) return;
+
+  let options: any = {
+    "generateMinifiedHtml": config.get<boolean>("x-generate-minified-html"),
+    "generateMinifiedCss":  config.get<boolean>("x-generate-minified-css"),
+    "generateMinifiedJs":   config.get<boolean>("x-generate-minified-js"),
+    "generateSourcemapCss": config.get<boolean>("x-generate-sourcemap-css"),
+    "generateSourcemapJs":  config.get<boolean>("x-generate-sourcemap-js"),
+
+    "compileErrorMsg":      config.get<boolean>("x-show-compile-error-messages"),
+    "generateHtmlExt":      config.get<boolean>("x-generate-html-ext"),
+    "compileFilesInMixinFolders": config.get<boolean>("x-compile-files-in-mixin-folders"),
+    "compileFilesOnSave":   config.get<boolean>("x-compile-files-on-save"),
+
+    "omitDevExtJs":         config.get<boolean>("x-omit-dev-ext-js"),
+  }
+  if (!options.compileFilesOnSave) return;
+  if (!options.compileFilesInMixinFolders && /[\/\\]mixin(s)*[\/\\]/.test(path)) { console.info('ignoring mixin', path);  return; }
+
+  const cbFinished = function() {
+    vscode.window.setStatusBarMessage(`Compile-Superhero: successful!`);
+  };
+  const cbError = function(this: any, e: Error) {
+    console.error(e);
+    vscode.window.setStatusBarMessage(`Compile-Superhero: failed!`);
+    if (options.compileErrorMsg)
+      vscode.window.showErrorMessage(e.message);
+  
+    if (this && this._writableState) this._writableState.finalCalled = true; // cancel further piping.
+  };
+  
   let outputPath = p.resolve(path, "../", outputDirectoryPath[fileSuffix]);
-  // console.log(fileSuffix);
-  switch (fileSuffix) {
-    case ".scss":
-    case ".sass":
-      let { text, status } = await compileSass(fileContext, {
-        style: sass.style.expanded || sass.style.compressed,
-        indentedSyntax: fileSuffix === ".sass" ? true : false,
-      });
-      if (status !== 0) {
-        vscode.window.setStatusBarMessage(errorMessage);
-        return;
-      }
-      src(path)
-        .pipe(empty(text))
-        .pipe(
-          rename({
-            extname: ".css",
-          })
-        )
-        .pipe(dest(outputPath))
-        .pipe(cssmin({ compatibility: "ie7" }))
-        .pipe(
-          rename({
-            extname: ".css",
-            suffix: ".min",
-          })
-        )
-        .pipe(dest(outputPath));
-      vscode.window.setStatusBarMessage(successMessage);
-      break;
-    case ".js":
-      if (/.dev.js|.prod.js$/g.test(path)) {
-        vscode.window.setStatusBarMessage(
-          `The prod or dev file has been processed and will not be compiled`
-        );
+
+  vscode.window.setStatusBarMessage(`Compiling ...`);
+
+  try {
+
+    switch (fileSuffix) {
+
+      case ".sass":
+      case ".scss":
+        let done = await sass.compileOne(uri, {
+          indentedSyntax: fileSuffix === ".sass" ? 1 : 0,
+          style: SassHelper.style.expanded,   // || SassHelper.style.compressed
+          // sourceMapFile: 'file', sourceMapRoot: 'root',    -> https://github.com/medialize/sass.js/blob/master/docs/api.md#sourcemap-options
+        });
+
+        if (done.status || done.formatted) {
+          cbError(new Error('SASS: ' + path + ': ' + (done.message || done.formatted) + (done.line ? ' (@' + done.line + ':' + done.column + ')' : '') ));
+          break;
+        }
+        let text = done.text;
+        if (options.generateMinifiedCss)
+          src(path)
+            .pipe(options.generateSourcemapCss ? sourcemaps.init({ largeFile: true }) : util_noop())
+            .pipe(empty(text))
+            .pipe(cssmin({ processImport: false, compatibility: "ie7" }))
+            .on('error', cbError)
+            .pipe(rename({ extname: ".css", suffix: ".min" }))
+            .pipe(options.generateSourcemapCss ? sourcemaps.write('./') : util_noop())
+            .pipe(dest(outputPath))
+            .on('error', cbError)
+            ;
+
+        src(path)
+          .pipe(options.generateSourcemapCss ? sourcemaps.init({ largeFile: true }) : util_noop())
+          .pipe(empty(text))
+          .pipe(
+            rename({
+              extname: ".css"
+            })
+          )
+          .pipe(options.generateSourcemapCss ? sourcemaps.write('./') : util_noop())
+          .pipe(dest(outputPath))
+          .on('error', cbError)
+          .on('finish', cbFinished);
         break;
-      }
-      src(path)
-        .pipe(
-          babel({
-            presets: [babelEnv],
-          }).on("error", (error: any) => {
-            vscode.window.showErrorMessage(error.message);
-            vscode.window.setStatusBarMessage(errorMessage);
-          })
-        )
-        .pipe(rename({ suffix: ".dev" }))
-        .pipe(dest(outputPath));
-      src(path)
-        .pipe(
-          babel({
-            presets: [babelEnv],
-          }).on("error", (error: any) => {
-            vscode.window.showErrorMessage(error.message);
-            vscode.window.setStatusBarMessage(errorMessage);
-          })
-        )
-        .pipe(uglify())
-        .pipe(rename({ suffix: ".prod" }))
-        .pipe(dest(outputPath));
-      vscode.window.setStatusBarMessage(successMessage);
-      break;
-    case ".less":
-      src(path)
-        .pipe(
-          less().on("error", (error: any) => {
-            vscode.window.showErrorMessage(error.message);
-            vscode.window.setStatusBarMessage(errorMessage);
-          })
-        )
-        .pipe(dest(outputPath))
-        .pipe(cssmin({ compatibility: "ie7" }))
-        .pipe(rename({ suffix: ".min" }))
-        .pipe(dest(outputPath))
-        .on("end", () => {
-          vscode.window.setStatusBarMessage(successMessage);
-        });
-      break;
-    case ".ts":
-      src(path)
-        .pipe(
-          ts().on("error", (error: any) => {
-            vscode.window.showErrorMessage(error.message);
-            vscode.window.setStatusBarMessage(errorMessage);
-          })
-        )
-        .pipe(dest(outputPath));
-      vscode.window.setStatusBarMessage(successMessage);
-      break;
-    case ".tsx":
-      src(path)
-        .pipe(
-          ts({
-            jsx: "react",
-          }).on("error", (error: any) => {
-            vscode.window.showErrorMessage(error.message);
-            vscode.window.setStatusBarMessage(errorMessage);
-          })
-        )
-        .pipe(dest(outputPath));
-      vscode.window.setStatusBarMessage(successMessage);
-      break;
-    case ".jade":
-      src(path)
-        .pipe(
-          jade({
-            pretty: true,
-          }).on("error", (error: any) => {
-            console.log(error);
-            vscode.window.showErrorMessage(error.message);
-            vscode.window.setStatusBarMessage(errorMessage);
-          })
-        )
-        .pipe(dest(outputPath));
-      src(path)
-        .pipe(
-          jade().on("error", (error: any) => {
-            vscode.window.showErrorMessage(error.message);
-            vscode.window.setStatusBarMessage(errorMessage);
-          })
-        )
-        .pipe(rename({ suffix: ".min" }))
-        .pipe(dest(outputPath));
-      vscode.window.setStatusBarMessage(successMessage);
-      break;
-    case ".pug":
-      let html = "";
-      try {
-        html = pug.renderFile(path, {
-          pretty: true,
-        });
-      } catch (error) {
-        vscode.window.showErrorMessage(error.message);
-        vscode.window.setStatusBarMessage(errorMessage);
-      }
-      src(path)
-        .pipe(empty(html))
-        .pipe(
-          rename({
-            extname: ".html",
-          })
-        )
-        .pipe(dest(outputPath))
-        .pipe(empty(pug.renderFile(path)))
-        .pipe(
-          rename({
-            suffix: ".min",
-            extname: ".html",
-          })
-        )
-        .pipe(dest(outputPath));
-      vscode.window.setStatusBarMessage(successMessage);
-      break;
-    default:
-      console.log("Not Found!");
-      break;
+
+      case ".js":
+        if (/\.dev\.js|\.prod\.js|\.min\.js$/g.test(path)) {
+          cbFinished();
+          vscode.window.showErrorMessage(
+            'The prod (.min.js) or dev file is the allready processed file and will not be compiled: ' + path
+          );
+          break;
+        }
+        if (options.generateMinifiedJs)
+          src(path)
+            .pipe(options.generateSourcemapJs ? sourcemaps.init() : util_noop())
+            .pipe(
+              babel({
+                presets: [babelEnv]
+              })
+            )
+            .on('error', cbError)
+            .pipe(uglify())
+            .on('error', cbError)
+            .pipe(rename({ suffix: ".min" }))
+            .pipe(options.generateSourcemapJs ? sourcemaps.write('./') : util_noop())
+            .pipe(dest(outputPath))
+            .on('error', cbError)
+            ;
+
+        src(path)
+          .pipe(options.generateSourcemapJs ? sourcemaps.init() : util_noop())
+          .pipe(
+            babel({
+              presets: [babelEnv]
+            })
+          )
+          .on('error', cbError)
+          .pipe(!options.omitDevExtJs ? rename({ suffix: '.dev' }) : util_noop())
+          .pipe(options.generateSourcemapJs ? sourcemaps.write('./') : util_noop())
+          .pipe(dest(outputPath))
+          .on('error', cbError)
+          .on('finish', cbFinished);
+        break;
+
+      case ".less":
+        if (options.generateMinifiedCss)
+          src(path)
+            .pipe(src(path))
+            .pipe(options.generateSourcemapCss ? sourcemaps.init({ largeFile: true }) : util_noop())
+            .pipe(less())
+            .on('error', cbError)
+            .pipe(cssmin({ processImport: false, compatibility: "ie7" }))
+            .on('error', cbError)
+            .pipe(rename({ suffix: ".min" }))
+            .pipe(options.generateSourcemapCss ? sourcemaps.write('./') : util_noop())
+            .pipe(dest(outputPath))
+            .on('error', cbError)
+            ;
+        
+        src(path)
+          .pipe(options.generateSourcemapCss ? sourcemaps.init({ largeFile: true }) : util_noop())
+          .pipe(less())
+          .on('error', cbError)
+          .pipe(options.generateSourcemapCss ? sourcemaps.write('./') : util_noop())
+          .pipe(dest(outputPath))
+          .on('error', cbError)
+          .on('finish', cbFinished);
+        break;
+
+      case ".ts":
+        if (options.generateMinifiedJs)
+          src(path)
+            .pipe(options.generateSourcemapJs ? sourcemaps.init() : util_noop())
+            .pipe(ts())
+            .on('error', cbError)
+            .pipe(uglify())
+            .on('error', cbError)
+            .pipe(rename({ suffix: ".min" }))
+            .pipe(options.generateSourcemapJs ? sourcemaps.write('./') : util_noop())
+            .pipe(dest(outputPath))
+            .on('error', cbError)
+            .on('finish', cbFinished);
+
+        src(path)
+          .pipe(options.generateSourcemapJs ? sourcemaps.init() : util_noop())
+          .pipe(ts())
+          .on('error', cbError)
+          .pipe(options.generateSourcemapJs ? sourcemaps.write('./') : util_noop())
+          .pipe(dest(outputPath))
+          .on('error', cbError)
+          .on('finish', cbFinished);
+        break;
+
+      case ".tsx":
+        if (options.generateMinifiedJs)
+          src(path)
+            .pipe(options.generateSourcemapJs ? sourcemaps.init() : util_noop())
+            .pipe(ts({
+              jsx: "react"
+            }))
+            .on('error', cbError)
+            .pipe(uglify())
+            .on('error', cbError)
+            .pipe(rename({ suffix: ".min" }))
+            .pipe(options.generateSourcemapJs ? sourcemaps.write('./') : util_noop())
+            .pipe(dest(outputPath))
+            .on('error', cbError)
+            .on('finish', cbFinished);
+
+        src(path)
+          .pipe(options.generateSourcemapJs ? sourcemaps.init() : util_noop())
+          .pipe(ts({
+            jsx: "react"
+          }))
+          .on('error', cbError)
+          .pipe(options.generateSourcemapJs ? sourcemaps.write('./') : util_noop())
+          .pipe(dest(outputPath))
+          .on('error', cbError)
+          .on('finish', cbFinished);
+        break;
+
+      case ".jade":
+        if (options.generateMinifiedHtml)
+          src(path)
+            .pipe(jade())
+            .on('error', cbError)
+            .pipe(rename({ suffix: ".min", extname: options.generateHtmlExt }))
+            .pipe(dest(outputPath))
+            .on('error', cbError)
+            ;
+
+        src(path)
+          .pipe(
+            jade({
+              pretty: true
+            })
+          )
+          .on('error', cbError)
+          .pipe(rename({ extname: options.generateHtmlExt }))
+          .pipe(dest(outputPath))
+          .on('error', cbError)
+          .on('finish', cbFinished);
+        break;
+
+      case ".pug":
+        try {  // catches from empty>promise.reject
+          if (options.generateMinifiedHtml)
+            src(path)
+              .pipe(
+                empty(
+                  await new Promise<string>((resolve, reject) => {
+                    pug.render(readFileContext(path), {
+                      filename: path,
+                      pretty: false
+                    }, (err: any, data: string) => { if (err) {cbError(err); reject(err);} else resolve(data); } )
+                  })
+                )
+              )
+              .on('error', cbError)
+              .pipe(
+                rename({
+                  suffix: ".min",
+                  extname: options.generateHtmlExt
+                })
+              )
+              .pipe(dest(outputPath))
+              .on('error', cbError)
+              ;
+
+          src(path)
+            .pipe(
+              empty(
+                await new Promise<string>((resolve, reject) => {
+                  pug.render(readFileContext(path), {
+                    filename: path,
+                    pretty: true
+                  }, (err: any, data: string) => { if (err) {cbError(err); reject(err);} else resolve(data); } )
+                })
+              )
+            )
+            .on('error', cbError)
+            .pipe(
+              rename({
+                extname: options.generateHtmlExt
+              })
+            )
+            .pipe(dest(outputPath))
+            .on('error', cbError)
+            .on('finish', cbFinished);
+
+          } catch(e) {}
+        break;
+
+      case ".html":
+        if (options.generateMinifiedHtml)
+          src(path)
+            .pipe(htmlmin({
+              collapseWhitespace: true,
+              caseSensitive: true,
+              continueOnParseError: false,
+            }))
+            .on('error', cbError)
+            .pipe(
+              rename({
+                suffix: ".min",
+                extname: options.generateHtmlExt
+              })
+            )
+            .pipe(dest(outputPath))
+            .on('error', cbError)
+            ;
+
+        src(path)
+          .pipe(dest(outputPath))
+          .on('error', cbError)
+          .on('finish', cbFinished);
+        break;
+
+      default:
+        console.error("Not Found!");
+        break;
+    }
+  }
+  catch(ex) {
+    cbError(ex);
   }
 };
 export function activate(context: vscode.ExtensionContext) {
-  console.log('Congratulations, your extension "qf" is now active!');
+  configscreen.activate(context);
+
+  console.log('Extension "compile-superhero" is ready now!');
+
+  if (vscode.workspace.getConfiguration("compile-hero")
+    .get<boolean>("x-compile-files-on-save"))
+    vscode.window.setStatusBarMessage(`Compile-Superhero: watching ...`);
+    
   let openInBrowser = vscode.commands.registerCommand(
     "extension.openInBrowser",
-    (path) => {
+    path => {
       let uri = path.fsPath;
       let platform = process.platform;
       open(uri, {
@@ -252,48 +424,73 @@ export function activate(context: vscode.ExtensionContext) {
             ? "chrome"
             : platform === "darwin"
             ? "google chrome"
-            : "google-chrome",
-        ],
+            : "google-chrome"
+        ]
       });
     }
   );
   let closePort = vscode.commands.registerCommand(
     "extension.closePort",
     async () => {
-      let inputPort = await vscode.window.showInputBox({
-        placeHolder: "Enter the port you need to close?",
-      });
-      let info = await command(`lsof -i :${inputPort}`);
-      let port = transformPort(info);
-      if (port) {
-        await command(`kill -9 ${port}`);
-        vscode.window.setStatusBarMessage("Port closed successfully!");
+      let platform = process.platform;
+
+      if (platform !== "win32") {    // ---> https://developers.de/blogs/indraneel/archive/2017/10/18/kill-a-process-in-windows-by-port-number.aspx might work
+
+        let inputPort = await vscode.window.showInputBox({
+          placeHolder: "Enter the port you need to close?"
+        });
+        let info = await command(`lsof -i :${inputPort}`);
+        let port = transformPort(info);
+        if (port) {
+          await command(`kill -9 ${port}`);
+          vscode.window.setStatusBarMessage("Port closed successfully!");
+        }
+      }
+      else {
+        vscode.window.showErrorMessage('SORRY. Does not work on Windows. But on OSX/Linux.');
       }
     }
   );
-
   let compileFile = vscode.commands.registerCommand(
     "extension.compileFile",
-    (path) => {
-      let uri = path.fsPath;
-      console.log(uri);
-      const fileContext: string = readFileContext(uri);
+    (uri: vscode.Uri) => {
+      console.log(uri.fsPath);
+      const fileContext: string = readFileContext(uri.fsPath);
       readFileName(uri, fileContext);
     }
+  );
+  let generateLocalDefaultConfig = vscode.commands.registerCommand(
+    "extension.generateLocalDefaultConfig",
+    async () => {
+      if (vscode.workspace.workspaceFolders) {
+        const config = vscode.workspace.getConfiguration('compile-hero');
+
+        for (let x in config) {
+          let e = config.inspect(x);
+          if (e?.defaultValue === undefined) continue;
+          
+          try {
+            await config.update(x, e?.workspaceValue !== undefined ? e?.workspaceValue : e?.globalValue !== undefined ? e?.globalValue : e?.defaultValue, vscode.ConfigurationTarget.Workspace);
+          }
+          catch(e) {
+            console.error(x, e);
+          }
+
+        };
+      }
+
+    }
+
   );
 
   context.subscriptions.push(openInBrowser);
   context.subscriptions.push(closePort);
   context.subscriptions.push(compileFile);
-  vscode.workspace.onDidSaveTextDocument((document) => {
-    let config = vscode.workspace.getConfiguration("compile-hero");
-    let isDisableOnDidSaveTextDocument =
-      config.get<string>("disable-compile-files-on-did-save-code") || "";
-    console.log(isDisableOnDidSaveTextDocument);
-    if (isDisableOnDidSaveTextDocument) return;
-    const { fileName } = document;
-    const fileContext: string = readFileContext(fileName);
-    readFileName(fileName, fileContext);
+  context.subscriptions.push(generateLocalDefaultConfig);
+  vscode.workspace.onDidSaveTextDocument(document => {
+    const { uri } = document;
+    const fileContext: string = readFileContext(uri.fsPath);
+    readFileName(uri, fileContext);
   });
 }
 export function deactivate() {}
